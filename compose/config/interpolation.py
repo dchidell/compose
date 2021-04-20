@@ -111,12 +111,14 @@ class TemplateWithDefaults(Template):
             var, _, err = braced.partition(':?')
             result = mapping.get(var)
             if not result:
+                err = err or var
                 raise UnsetRequiredSubstitution(err)
             return result
         elif '?' == sep:
             var, _, err = braced.partition('?')
             if var in mapping:
                 return mapping.get(var)
+            err = err or var
             raise UnsetRequiredSubstitution(err)
 
     # Modified from python2.7/string.py
@@ -241,6 +243,7 @@ class ConversionMap:
         service_path('healthcheck', 'disable'): to_boolean,
         service_path('deploy', 'labels', PATH_JOKER): to_str,
         service_path('deploy', 'replicas'): to_int,
+        service_path('deploy', 'placement', 'max_replicas_per_node'): to_int,
         service_path('deploy', 'resources', 'limits', "cpus"): to_float,
         service_path('deploy', 'update_config', 'parallelism'): to_int,
         service_path('deploy', 'update_config', 'max_failure_ratio'): to_float,

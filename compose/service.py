@@ -1,6 +1,5 @@
 import enum
 import itertools
-import json
 import logging
 import os
 import re
@@ -45,6 +44,7 @@ from .const import LABEL_VERSION
 from .const import NANOCPUS_SCALE
 from .const import WINDOWS_LONGPATH_PREFIX
 from .container import Container
+from .errors import CompletedUnsuccessfully
 from .errors import HealthCheckFailed
 from .errors import NoHealthCheckConfigured
 from .errors import OperationFailedError
@@ -77,6 +77,7 @@ HOST_CONFIG_KEYS = [
     'cpuset',
     'device_cgroup_rules',
     'devices',
+    'device_requests',
     'dns',
     'dns_search',
     'dns_opt',
@@ -111,6 +112,7 @@ HOST_CONFIG_KEYS = [
 
 CONDITION_STARTED = 'service_started'
 CONDITION_HEALTHY = 'service_healthy'
+CONDITION_COMPLETED_SUCCESSFULLY = 'service_completed_successfully'
 
 
 class BuildError(Exception):
@@ -711,12 +713,13 @@ class Service:
             'image_id': image_id(),
             'links': self.get_link_names(),
             'net': self.network_mode.id,
+            'ipc_mode': self.ipc_mode.mode,
             'networks': self.networks,
             'secrets': self.secrets,
             'volumes_from': [
                 (v.source.name, v.mode)
                 for v in self.volumes_from if isinstance(v.source, Service)
-            ],
+            ]
         }
 
     def get_dependency_names(self):
@@ -752,6 +755,8 @@ class Service:
                 configs[svc] = lambda s: True
             elif config['condition'] == CONDITION_HEALTHY:
                 configs[svc] = lambda s: s.is_healthy()
+            elif config['condition'] == CONDITION_COMPLETED_SUCCESSFULLY:
+                configs[svc] = lambda s: s.is_completed_successfully()
             else:
                 # The config schema already prevents this, but it might be
                 # bypassed if Compose is called programmatically.
@@ -1016,6 +1021,7 @@ class Service:
             privileged=options.get('privileged', False),
             network_mode=self.network_mode.mode,
             devices=options.get('devices'),
+            device_requests=options.get('device_requests'),
             dns=options.get('dns'),
             dns_opt=options.get('dns_opt'),
             dns_search=options.get('dns_search'),
@@ -1101,8 +1107,9 @@ class Service:
                 'Impossible to perform platform-targeted builds for API version < 1.35'
             )
 
-        builder = self.client if not cli else _CLIBuilder(progress)
-        build_output = builder.build(
+        builder = _ClientBuilder(self.client) if not cli else _CLIBuilder(progress)
+        return builder.build(
+            service=self,
             path=path,
             tag=self.image_name,
             rm=rm,
@@ -1123,30 +1130,7 @@ class Service:
             gzip=gzip,
             isolation=build_opts.get('isolation', self.options.get('isolation', None)),
             platform=self.platform,
-        )
-
-        try:
-            all_events = list(stream_output(build_output, output_stream))
-        except StreamOutputError as e:
-            raise BuildError(self, str(e))
-
-        # Ensure the HTTP connection is not reused for another
-        # streaming command, as the Docker daemon can sometimes
-        # complain about it
-        self.client.close()
-
-        image_id = None
-
-        for event in all_events:
-            if 'stream' in event:
-                match = re.search(r'Successfully built ([0-9a-f]+)', event.get('stream', ''))
-                if match:
-                    image_id = match.group(1)
-
-        if image_id is None:
-            raise BuildError(self, event if all_events else 'Unknown')
-
-        return image_id
+            output_stream=output_stream)
 
     def get_cache_from(self, build_opts):
         cache_from = build_opts.get('cache_from', None)
@@ -1302,6 +1286,21 @@ class Service:
                 raise HealthCheckFailed(ctnr.short_id)
         return result
 
+    def is_completed_successfully(self):
+        """ Check that all containers for this service has completed successfully
+            Returns false if at least one container does not exited and
+            raises CompletedUnsuccessfully exception if at least one container
+            exited with non-zero exit code.
+        """
+        result = True
+        for ctnr in self.containers(stopped=True):
+            ctnr.inspect()
+            if ctnr.get('State.Status') != 'exited':
+                result = False
+            elif ctnr.exit_code != 0:
+                raise CompletedUnsuccessfully(ctnr.short_id, ctnr.exit_code)
+        return result
+
     def _parse_proxy_config(self):
         client = self.client
         if 'proxies' not in client._general_configs:
@@ -1326,6 +1325,24 @@ class Service:
             result[permitted[k]] = result[permitted[k].lower()] = v
 
         return result
+
+    def get_profiles(self):
+        if 'profiles' not in self.options:
+            return []
+
+        return self.options.get('profiles')
+
+    def enabled_for_profiles(self, enabled_profiles):
+        # if service has no profiles specified it is always enabled
+        if 'profiles' not in self.options:
+            return True
+
+        service_profiles = self.options.get('profiles')
+        for profile in enabled_profiles:
+            if profile in service_profiles:
+                return True
+
+        return False
 
 
 def short_id_alias_exists(container, network):
@@ -1770,20 +1787,77 @@ def rewrite_build_path(path):
     return path
 
 
-class _CLIBuilder:
-    def __init__(self, progress):
-        self._progress = progress
+class _ClientBuilder:
+    def __init__(self, client):
+        self.client = client
 
-    def build(self, path, tag=None, quiet=False, fileobj=None,
+    def build(self, service, path, tag=None, quiet=False, fileobj=None,
               nocache=False, rm=False, timeout=None,
               custom_context=False, encoding=None, pull=False,
               forcerm=False, dockerfile=None, container_limits=None,
               decode=False, buildargs=None, gzip=False, shmsize=None,
               labels=None, cache_from=None, target=None, network_mode=None,
               squash=None, extra_hosts=None, platform=None, isolation=None,
-              use_config_proxy=True):
+              use_config_proxy=True, output_stream=sys.stdout):
+        build_output = self.client.build(
+            path=path,
+            tag=tag,
+            nocache=nocache,
+            rm=rm,
+            pull=pull,
+            forcerm=forcerm,
+            dockerfile=dockerfile,
+            labels=labels,
+            cache_from=cache_from,
+            buildargs=buildargs,
+            network_mode=network_mode,
+            target=target,
+            shmsize=shmsize,
+            extra_hosts=extra_hosts,
+            container_limits=container_limits,
+            gzip=gzip,
+            isolation=isolation,
+            platform=platform)
+
+        try:
+            all_events = list(stream_output(build_output, output_stream))
+        except StreamOutputError as e:
+            raise BuildError(service, str(e))
+
+        # Ensure the HTTP connection is not reused for another
+        # streaming command, as the Docker daemon can sometimes
+        # complain about it
+        self.client.close()
+
+        image_id = None
+
+        for event in all_events:
+            if 'stream' in event:
+                match = re.search(r'Successfully built ([0-9a-f]+)', event.get('stream', ''))
+                if match:
+                    image_id = match.group(1)
+
+        if image_id is None:
+            raise BuildError(service, event if all_events else 'Unknown')
+
+        return image_id
+
+
+class _CLIBuilder:
+    def __init__(self, progress):
+        self._progress = progress
+
+    def build(self, service, path, tag=None, quiet=False, fileobj=None,
+              nocache=False, rm=False, timeout=None,
+              custom_context=False, encoding=None, pull=False,
+              forcerm=False, dockerfile=None, container_limits=None,
+              decode=False, buildargs=None, gzip=False, shmsize=None,
+              labels=None, cache_from=None, target=None, network_mode=None,
+              squash=None, extra_hosts=None, platform=None, isolation=None,
+              use_config_proxy=True, output_stream=sys.stdout):
         """
         Args:
+            service (str): Service to be built
             path (str): Path to the directory containing the Dockerfile
             buildargs (dict): A dictionary of build arguments
             cache_from (:py:class:`list`): A list of images used for build
@@ -1832,10 +1906,11 @@ class _CLIBuilder:
                 configuration file (``~/.docker/config.json`` by default)
                 contains a proxy configuration, the corresponding environment
                 variables will be set in the container being built.
+            output_stream (writer): stream to use for build logs
         Returns:
             A generator for the build output.
         """
-        if dockerfile:
+        if dockerfile and os.path.isdir(path):
             dockerfile = os.path.join(path, dockerfile)
         iidfile = tempfile.mktemp()
 
@@ -1853,35 +1928,29 @@ class _CLIBuilder:
         command_builder.add_arg("--tag", tag)
         command_builder.add_arg("--target", target)
         command_builder.add_arg("--iidfile", iidfile)
+        command_builder.add_arg("--platform", platform)
+        command_builder.add_arg("--isolation", isolation)
+
+        if extra_hosts:
+            if isinstance(extra_hosts, dict):
+                extra_hosts = ["{}:{}".format(host, ip) for host, ip in extra_hosts.items()]
+            for host in extra_hosts:
+                command_builder.add_arg("--add-host", "{}".format(host))
+
         args = command_builder.build([path])
 
-        magic_word = "Successfully built "
-        appear = False
-        with subprocess.Popen(args, stdout=subprocess.PIPE,
+        with subprocess.Popen(args, stdout=output_stream, stderr=sys.stderr,
                               universal_newlines=True) as p:
-            while True:
-                line = p.stdout.readline()
-                if not line:
-                    break
-                if line.startswith(magic_word):
-                    appear = True
-                yield json.dumps({"stream": line})
-
             p.communicate()
             if p.returncode != 0:
-                raise StreamOutputError()
+                raise BuildError(service, "Build failed")
 
         with open(iidfile) as f:
             line = f.readline()
             image_id = line.split(":")[1].strip()
         os.remove(iidfile)
 
-        # In case of `DOCKER_BUILDKIT=1`
-        # there is no success message already present in the output.
-        # Since that's the way `Service::build` gets the `image_id`
-        # it has to be added `manually`
-        if not appear:
-            yield json.dumps({"stream": "{}{}\n".format(magic_word, image_id)})
+        return image_id
 
 
 class _CommandBuilder:

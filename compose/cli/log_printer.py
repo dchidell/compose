@@ -16,18 +16,22 @@ from compose.utils import split_buffer
 
 class LogPresenter:
 
-    def __init__(self, prefix_width, color_func):
+    def __init__(self, prefix_width, color_func, keep_prefix=True):
         self.prefix_width = prefix_width
         self.color_func = color_func
+        self.keep_prefix = keep_prefix
 
     def present(self, container, line):
-        prefix = container.name_without_project.ljust(self.prefix_width)
-        return '{prefix} {line}'.format(
-            prefix=self.color_func(prefix + ' |'),
-            line=line)
+        to_log = '{line}'.format(line=line)
+
+        if self.keep_prefix:
+            prefix = container.name_without_project.ljust(self.prefix_width)
+            to_log = '{prefix} '.format(prefix=self.color_func(prefix + ' |')) + to_log
+
+        return to_log
 
 
-def build_log_presenters(service_names, monochrome):
+def build_log_presenters(service_names, monochrome, keep_prefix=True):
     """Return an iterable of functions.
 
     Each function can be used to format the logs output of a container.
@@ -38,7 +42,7 @@ def build_log_presenters(service_names, monochrome):
         return text
 
     for color_func in cycle([no_color] if monochrome else colors.rainbow()):
-        yield LogPresenter(prefix_width, color_func)
+        yield LogPresenter(prefix_width, color_func, keep_prefix)
 
 
 def max_name_width(service_names, max_index_width=3):
@@ -154,10 +158,8 @@ class QueueItem(namedtuple('_QueueItem', 'item is_stop exc')):
 
 
 def tail_container_logs(container, presenter, queue, log_args):
-    generator = get_log_generator(container)
-
     try:
-        for item in generator(container, log_args):
+        for item in build_log_generator(container, log_args):
             queue.put(QueueItem.new(presenter.present(container, item)))
     except Exception as e:
         queue.put(QueueItem.exception(e))
@@ -165,20 +167,6 @@ def tail_container_logs(container, presenter, queue, log_args):
     if log_args.get('follow'):
         queue.put(QueueItem.new(presenter.color_func(wait_on_exit(container))))
     queue.put(QueueItem.stop(container.name))
-
-
-def get_log_generator(container):
-    if container.has_api_logs:
-        return build_log_generator
-    return build_no_log_generator
-
-
-def build_no_log_generator(container, log_args):
-    """Return a generator that prints a warning about logs and waits for
-    container to exit.
-    """
-    yield "WARNING: no logs are available with the '{}' log driver\n".format(
-        container.log_driver)
 
 
 def build_log_generator(container, log_args):
